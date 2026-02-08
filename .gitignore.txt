@@ -1,0 +1,16 @@
+# 忽略 Python 缓存
+__pycache__/
+*.pyc
+
+# 忽略 PyCharm 配置
+.idea/
+
+# 忽略虚拟环境 (如果你有)
+venv/
+
+# 忽略测试文件 (保护隐私)
+*.pdf
+*.pptx
+
+# 忽略系统文件
+.DS_Store
