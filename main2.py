@@ -175,7 +175,7 @@ def merge_text_blocks(ocr_data):
 
 
 def convert_pdf_to_editable_ppt(pdf_path, output_ppt_path):
-    print(f"--- 启动转换: K-Means聚类取色 + 强力清洗背景 ---")
+    print(f"--- 启动转换: K-Means聚类 + 强力清洗背景 ---")
 
     ocr = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
 
