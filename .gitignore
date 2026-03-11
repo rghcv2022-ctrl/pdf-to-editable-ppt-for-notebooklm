@@ -14,3 +14,6 @@ venv/
 
 # 忽略系统文件
 .DS_Store
+build/
+dist/
+*.exe
