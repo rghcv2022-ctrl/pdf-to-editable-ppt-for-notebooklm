@@ -5,28 +5,21 @@ import os
 import ssl
 import statistics
 import sys
+import threading
 import traceback
 from shutil import which
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
-import cv2
-import numpy as np
-import paddle
-from PIL import Image
-from pdf2image import convert_from_path
-from paddleocr import PaddleOCR
-from pptx import Presentation
-from pptx.dml.color import RGBColor
-from pptx.enum.shapes import MSO_SHAPE_TYPE
-from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE
-from pptx.util import Inches, Pt
+from .color_analysis import estimate_text_rgb
 
-try:
-    import torch
-    TORCH_IMPORT_ERROR = None
-except Exception as exc:
-    torch = None
-    TORCH_IMPORT_ERROR = exc
+if TYPE_CHECKING:
+    from PIL import Image
+    from paddleocr import PaddleOCR
+    from pptx import Presentation
+else:
+    Image = Any
+    PaddleOCR = Any
+    Presentation = Any
 
 ssl._create_default_https_context = ssl._create_unverified_context
 os.environ["FLAGS_use_mkldnn"] = "0"
@@ -87,19 +80,60 @@ DEFAULT_OCR_CONFIG = {
     "det_db_unclip_ratio": 2.5,
     "use_dilation": True,
 }
+MIN_OCR_CONFIDENCE = 0.35
 
 LogFn = Callable[[str], None]
 
-_DEVICE = "cuda" if torch is not None and torch.cuda.is_available() else "cpu"
 _RUNTIME_READY = False
 _LAMA_MODEL = None
 _HAS_LAMA = False
+_OCR_ENGINE: Optional[PaddleOCR] = None
+_OCR_LOCK = threading.Lock()
+_TORCH = None
+_TORCH_IMPORT_ERROR = None
+_TORCH_LOAD_ATTEMPTED = False
 
 
 def _log(logger: Optional[LogFn], message: str) -> None:
     if logger is None:
         return
     logger(str(message))
+
+
+def build_ocr_dependency_error_message(exc: Exception) -> str:
+    details = str(exc)
+    if "Descriptors cannot be created directly" in details:
+        return (
+            "PaddleOCR failed to initialize because the installed protobuf version is "
+            "incompatible with Paddle. Install `protobuf<=3.20.3` in this environment, "
+            "or set `PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python` as a slower fallback. "
+            f"Original error: {details}"
+        )
+    return f"PaddleOCR failed to initialize: {details}"
+
+
+def _load_torch():
+    global _TORCH, _TORCH_IMPORT_ERROR, _TORCH_LOAD_ATTEMPTED
+
+    if _TORCH_LOAD_ATTEMPTED:
+        return _TORCH, _TORCH_IMPORT_ERROR
+
+    _TORCH_LOAD_ATTEMPTED = True
+    try:
+        import torch as torch_module
+
+        _TORCH = torch_module
+        _TORCH_IMPORT_ERROR = None
+    except Exception as exc:
+        _TORCH = None
+        _TORCH_IMPORT_ERROR = exc
+
+    return _TORCH, _TORCH_IMPORT_ERROR
+
+
+def _get_device() -> str:
+    torch_module, _ = _load_torch()
+    return "cuda" if torch_module is not None and torch_module.cuda.is_available() else "cpu"
 
 
 def get_runtime_summary() -> list[str]:
@@ -120,24 +154,25 @@ def log_runtime_summary(logger: Optional[LogFn] = print) -> None:
 
 
 def _patch_torch_load_for_cpu() -> None:
-    if torch is None:
+    torch_module, _ = _load_torch()
+    if torch_module is None:
         return
-    if _DEVICE != "cpu":
+    if _get_device() != "cpu":
         return
-    if getattr(torch.jit.load, "_convertppt_safe_cpu_patch", False):
+    if getattr(torch_module.jit.load, "_convertppt_safe_cpu_patch", False):
         return
 
-    original_load = torch.jit.load
+    original_load = torch_module.jit.load
 
     def _safe_cpu_load(f, map_location=None, _extra_files=None):
         return original_load(
             f,
-            map_location=torch.device("cpu"),
+            map_location=torch_module.device("cpu"),
             _extra_files=_extra_files,
         )
 
     _safe_cpu_load._convertppt_safe_cpu_patch = True
-    torch.jit.load = _safe_cpu_load
+    torch_module.jit.load = _safe_cpu_load
 
 
 def initialize_runtime(logger: Optional[LogFn] = print) -> None:
@@ -155,9 +190,11 @@ def initialize_runtime(logger: Optional[LogFn] = print) -> None:
         _log(logger, "Set CONVERTPPT_USE_LAMA=1 if you later repair the Torch environment.")
         return
 
-    _log(logger, f"AI inpainting backend: {_DEVICE.upper()}")
-    if TORCH_IMPORT_ERROR is not None:
-        _log(logger, f"Torch unavailable, using OpenCV fallback: {TORCH_IMPORT_ERROR}")
+    device = _get_device()
+    torch_module, torch_import_error = _load_torch()
+    _log(logger, f"AI inpainting backend: {device.upper()}")
+    if torch_import_error is not None:
+        _log(logger, f"Torch unavailable, using OpenCV fallback: {torch_import_error}")
 
     _patch_torch_load_for_cpu()
 
@@ -193,12 +230,30 @@ def resolve_poppler_path() -> Optional[str]:
 
 
 def create_ocr_engine(logger: Optional[LogFn] = print) -> PaddleOCR:
+    global _OCR_ENGINE
+
     initialize_runtime(logger)
-    _log(logger, "Initializing OCR engine (CPU stable mode)...")
-    paddle.set_device("cpu")
-    ocr_engine = PaddleOCR(**DEFAULT_OCR_CONFIG)
-    _log(logger, "OCR engine is ready.")
-    return ocr_engine
+    if _OCR_ENGINE is not None:
+        return _OCR_ENGINE
+
+    with _OCR_LOCK:
+        if _OCR_ENGINE is not None:
+            return _OCR_ENGINE
+
+        try:
+            import paddle
+            from paddleocr import PaddleOCR
+        except Exception as exc:
+            raise RuntimeError(build_ocr_dependency_error_message(exc)) from exc
+
+        _log(logger, "Initializing OCR engine (CPU stable mode)...")
+        try:
+            paddle.set_device("cpu")
+            _OCR_ENGINE = PaddleOCR(**DEFAULT_OCR_CONFIG)
+        except Exception as exc:
+            raise RuntimeError(build_ocr_dependency_error_message(exc)) from exc
+        _log(logger, "OCR engine is ready.")
+        return _OCR_ENGINE
 
 
 def is_supported_input(path: str) -> bool:
@@ -260,6 +315,10 @@ def smart_clean_image_ai(
     logger: Optional[LogFn] = print,
 ) -> Image.Image:
     try:
+        import cv2
+        import numpy as np
+        from PIL import Image as PILImage
+
         initialize_runtime(logger)
         pil_img = normalize_image(pil_img)
         width, height = pil_img.size
@@ -283,72 +342,45 @@ def smart_clean_image_ai(
 
         if _HAS_LAMA and _LAMA_MODEL is not None:
             try:
-                return _LAMA_MODEL(pil_img, Image.fromarray(feathered_mask))
+                return _LAMA_MODEL(pil_img, PILImage.fromarray(feathered_mask))
             except RuntimeError:
-                if torch is not None and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                torch_module, _ = _load_torch()
+                if torch_module is not None and torch_module.cuda.is_available():
+                    torch_module.cuda.empty_cache()
 
-        img_np = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        img_np = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
         repaired = cv2.inpaint(img_np, mask, 5, cv2.INPAINT_TELEA)
-        return Image.fromarray(cv2.cvtColor(repaired, cv2.COLOR_BGR2RGB))
+        return PILImage.fromarray(cv2.cvtColor(repaired, cv2.COLOR_BGR2RGB))
     except Exception as exc:
         _log(logger, f"Image cleanup failed, keeping original image: {exc}")
         return normalize_image(pil_img)
 
 
-def get_text_color_kmeans(pil_image: Image.Image, box) -> RGBColor:
+def get_text_color_kmeans(pil_image: Image.Image, box):
+    from pptx.dml.color import RGBColor
+
     try:
-        pil_image = normalize_image(pil_image)
-        roi = np.array(pil_image)[
-            int(max(0, box[0][1])) : int(min(pil_image.size[1], box[2][1])),
-            int(max(0, box[0][0])) : int(min(pil_image.size[0], box[2][0])),
-        ]
-        if roi.size == 0:
-            return RGBColor(0, 0, 0)
+        import numpy as np
 
-        pixels = roi.reshape((-1, 3)).astype(np.float32)
-        _, labels, centers = cv2.kmeans(
-            pixels,
-            2,
-            None,
-            (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0),
-            10,
-            cv2.KMEANS_RANDOM_CENTERS,
-        )
-        _, counts = np.unique(labels, return_counts=True)
-        indices = np.argsort(counts)[::-1]
-        background_color = centers[indices[0]]
-        foreground_color = centers[indices[1]] if len(indices) > 1 else background_color
-
-        def get_luminance(color) -> float:
-            return 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
-
-        background_luminance = get_luminance(background_color)
-        foreground_luminance = get_luminance(foreground_color)
-        if background_luminance > 200:
-            final_color = (
-                foreground_color
-                if foreground_luminance < background_luminance
-                else background_color
-            )
-        elif background_luminance < 50:
-            final_color = (
-                foreground_color
-                if foreground_luminance > background_luminance
-                else background_color
-            )
-        else:
-            final_color = foreground_color
-
-        if get_luminance(final_color) > 230:
-            return RGBColor(0, 0, 0)
-        return RGBColor(
-            int(final_color[0]),
-            int(final_color[1]),
-            int(final_color[2]),
-        )
+        rgb = estimate_text_rgb(np.asarray(normalize_image(pil_image)), box)
+        return RGBColor(*rgb)
     except Exception:
         return RGBColor(0, 0, 0)
+
+
+def should_keep_text_block(text_content: str, confidence: float) -> bool:
+    normalized_text = text_content.strip()
+    if not normalized_text:
+        return False
+    if confidence < MIN_OCR_CONFIDENCE:
+        return False
+
+    lowered = normalized_text.lower()
+    if any(keyword in lowered for keyword in WATERMARK_KEYWORDS):
+        return False
+    if len(normalized_text) < 2 and not normalized_text.isdigit() and not normalized_text.isalpha():
+        return False
+    return True
 
 
 def process_single_image_content(
@@ -357,14 +389,17 @@ def process_single_image_content(
     logger: Optional[LogFn] = print,
 ):
     try:
+        import numpy as np
+        from PIL import Image as PILImage
+
         pil_img = normalize_image(pil_img)
-        result = ocr_engine.ocr(np.array(pil_img), cls=True)
+        result = ocr_engine.ocr(np.asarray(pil_img), cls=True)
 
         if result is None or len(result) == 0 or result[0] is None:
             _log(logger, "OCR returned empty result, retrying with 80% scaled image...")
             width, height = pil_img.size
-            small_img = pil_img.resize((int(width * 0.8), int(height * 0.8)), Image.LANCZOS)
-            retry_result = ocr_engine.ocr(np.array(small_img), cls=True)
+            small_img = pil_img.resize((int(width * 0.8), int(height * 0.8)), PILImage.LANCZOS)
+            retry_result = ocr_engine.ocr(np.asarray(small_img), cls=True)
 
             if retry_result and len(retry_result) > 0 and retry_result[0]:
                 _log(logger, f"OCR retry succeeded with {len(retry_result[0])} text blocks.")
@@ -386,12 +421,8 @@ def process_single_image_content(
             text_content = line[1][0]
             if not isinstance(text_content, str):
                 continue
-
-            is_watermark = any(keyword in text_content.lower() for keyword in WATERMARK_KEYWORDS)
-            if len(text_content) < 2 and not text_content.isdigit() and not text_content.isalpha():
-                is_watermark = True
-
-            if not is_watermark:
+            confidence = float(line[1][1]) if len(line[1]) > 1 else 1.0
+            if should_keep_text_block(text_content, confidence):
                 text_data.append(line)
 
         merged_blocks = convert_raw_to_blocks(text_data)
@@ -440,9 +471,15 @@ def create_text_boxes_on_slide(
     scale_x: float = 1.0,
     scale_y: float = 1.0,
 ) -> None:
+    import numpy as np
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE
+    from pptx.util import Inches, Pt
+
     prs_width_inches = prs.slide_width.inches
     off_x_val = offset_x.inches if hasattr(offset_x, "inches") else 0
     blocks_with_font = calculate_unified_font_sizes(merged_blocks, scale_y)
+    image_array = np.asarray(normalize_image(original_img))
 
     for block in blocks_with_font:
         box = block["box"]
@@ -481,11 +518,13 @@ def create_text_boxes_on_slide(
         paragraph.text = full_text
         paragraph.font.size = Pt(max(5, block["final_font_pt"]))
         paragraph.font.name = block["font_name"]
-        paragraph.font.color.rgb = get_text_color_kmeans(original_img, block["sample_box"])
+        paragraph.font.color.rgb = RGBColor(*estimate_text_rgb(image_array, block["sample_box"]))
         paragraph.line_spacing = 1.0
 
 
 def iter_picture_shapes(shapes, parent_offset=(0, 0)):
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
     for shape in shapes:
         left = parent_offset[0] + shape.left
         top = parent_offset[1] + shape.top
@@ -501,6 +540,10 @@ def process_pdf_file(
     ocr_engine: PaddleOCR,
     logger: Optional[LogFn] = print,
 ) -> str:
+    from pdf2image import convert_from_path
+    from pptx import Presentation
+    from pptx.util import Inches
+
     _log(logger, "Running PDF conversion...")
     poppler_path = resolve_poppler_path()
     if poppler_path is None and not which("pdftoppm"):
@@ -526,7 +569,7 @@ def process_pdf_file(
             clean_bg, blocks = process_single_image_content(image, ocr_engine, logger=logger)
             final_bg = clean_bg if clean_bg is not None else image
             bg_stream = io.BytesIO()
-            final_bg.save(bg_stream, format="JPEG")
+            final_bg.save(bg_stream, format="JPEG", quality=95, subsampling=0)
             bg_stream.seek(0)
             slide.shapes.add_picture(bg_stream, 0, 0, width=prs.slide_width, height=prs.slide_height)
             if blocks:
@@ -548,6 +591,10 @@ def process_pptx_file(
     ocr_engine: PaddleOCR,
     logger: Optional[LogFn] = print,
 ) -> str:
+    from PIL import Image as PILImage
+    from pptx import Presentation
+    from pptx.util import Inches
+
     _log(logger, "Running PPTX conversion...")
     prs = Presentation(input_pptx)
 
@@ -555,7 +602,8 @@ def process_pptx_file(
         _log(logger, f"Processing slide {slide_index}/{len(prs.slides)}...")
         for shape, left, top in list(iter_picture_shapes(slide.shapes)):
             try:
-                img_pil = normalize_image(Image.open(io.BytesIO(shape.image.blob)))
+                with PILImage.open(io.BytesIO(shape.image.blob)) as source_image:
+                    img_pil = normalize_image(source_image.copy())
                 clean_bg, blocks = process_single_image_content(img_pil, ocr_engine, logger=logger)
                 final_bg = clean_bg if clean_bg is not None else img_pil
 

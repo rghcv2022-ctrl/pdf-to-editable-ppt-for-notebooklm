@@ -17,3 +17,10 @@ venv/
 build/
 dist/
 *.exe
+*.pyo
+*.pyd
+*.swp
+*.swo
+*.tmp
+*.bak
+poppler/

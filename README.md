@@ -16,10 +16,15 @@
 ## 当前项目结构
 
 ```text
-converter_core.py   核心转换逻辑
-ui.py               Tkinter 图形界面入口
-ppt2ppt.py          命令行入口
-main2.py            简单示例入口
+convertppt/         Python 包实现
+  __init__.py        包导出接口
+  core.py            核心转换逻辑
+  cli.py             命令行入口实现
+  gui.py             GUI 入口实现
+  example.py         简单示例入口实现
+ppt2ppt.py          命令行入口脚本
+ui.py               Tkinter 图形界面入口脚本
+main2.py            简单示例入口脚本
 ui.spec             PyInstaller 打包配置
 requirements.txt    Python 依赖
 ```
@@ -107,6 +112,12 @@ python ui.py
 python ppt2ppt.py input.pdf
 python ppt2ppt.py input.pptx
 python ppt2ppt.py input.pdf output.pptx
+```
+
+你也可以直接运行包入口：
+
+```powershell
+python -m convertppt input.pdf
 ```
 
 ### 示例脚本

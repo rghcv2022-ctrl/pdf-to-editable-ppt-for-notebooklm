@@ -23,6 +23,7 @@ simple-lama-inpainting>=0.1.0
 # === 基础依赖库 ===
 # 极其重要：强制锁定 Numpy 在 2.0 以下，防止 Paddle 和 OpenCV 崩溃
 numpy<2.0.0
+protobuf<=3.20.3
 shapely
 scikit-image
 imgaug
